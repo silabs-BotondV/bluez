@@ -1083,10 +1083,6 @@ static bool parse_min_interval(DBusMessageIter *iter,
 {
 	uint32_t min_interval_ms;
 
-	/* Only consider this property if experimental setting is applied */
-	if (!(g_dbus_get_flags() & G_DBUS_FLAG_ENABLE_EXPERIMENTAL))
-		return true;
-
 	if (!iter) {
 		client->min_interval = 0;
 		return false;
@@ -1116,10 +1112,6 @@ static bool parse_max_interval(DBusMessageIter *iter,
 {
 	uint32_t max_interval_ms;
 
-	/* Only consider this property if experimental setting is applied */
-	if (!(g_dbus_get_flags() & G_DBUS_FLAG_ENABLE_EXPERIMENTAL))
-		return true;
-
 	if (!iter) {
 		client->max_interval = 0;
 		return false;
@@ -1148,10 +1140,6 @@ static bool parse_tx_power(DBusMessageIter *iter,
 					struct btd_adv_client *client)
 {
 	int16_t val;
-
-	/* Only consider this property if experimental setting is applied */
-	if (!(g_dbus_get_flags() & G_DBUS_FLAG_ENABLE_EXPERIMENTAL))
-		return true;
 
 	if (!iter) {
 		client->tx_power = ADV_TX_POWER_NO_PREFERENCE;
