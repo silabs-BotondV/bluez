@@ -86,6 +86,25 @@
 #define DISTANCE_VAL_INVALID	0x7FFF
 #define PATHLOSS_MAX		137
 
+#define DISCOV_SCAN_INTERVAL_DEFAULT	0x0010
+#define DISCOV_SCAN_WINDOW_DEFAULT	0x0010
+
+#ifndef LE_SCAN_PASSIVE
+#define LE_SCAN_PASSIVE	0x00
+#endif
+
+#ifndef LE_SCAN_ACTIVE
+#define LE_SCAN_ACTIVE	0x01
+#endif
+
+#ifndef LE_SCAN_FILTER_DUP_ENABLE
+#define LE_SCAN_FILTER_DUP_ENABLE	0x01
+#endif
+
+#ifndef LE_SCAN_FILTER_DUP_DISABLE
+#define LE_SCAN_FILTER_DUP_DISABLE	0x00
+#endif
+
 /*
  * These are known security keys that have been compromised.
  * If this grows or there are needs to be platform specific, it is
@@ -212,6 +231,11 @@ struct discovery_filter {
 	GSList *uuids;
 	bool duplicate;
 	bool discoverable;
+	bool has_active;
+	bool active;
+	bool has_scan_params;
+	uint16_t interval;
+	uint16_t window;
 };
 
 struct discovery_client {
@@ -297,6 +321,13 @@ struct btd_adapter {
 					      * runs
 					      */
 	unsigned int passive_scan_timeout; /* timeout between passive scans */
+
+	bool discovery_scan_passive;
+	bool discovery_scan_has_timing;
+	uint16_t discovery_scan_interval;
+	uint16_t discovery_scan_window;
+	bool discovery_scan_duplicate;
+	bool passive_scan_session;
 
 	unsigned int pairable_timeout_id;	/* pairable timeout id */
 	guint auth_idle_id;		/* Pending authorization dequeue */
@@ -1787,6 +1818,13 @@ static void discovery_remove(struct discovery_client *client)
 
 static void trigger_start_discovery(struct btd_adapter *adapter, guint delay);
 
+static void merge_discovery_scan_settings(struct btd_adapter *adapter);
+static void apply_discovery_scan_settings(struct btd_adapter *adapter);
+static int start_passive_le_discovery(struct btd_adapter *adapter);
+static void stop_passive_le_discovery(struct btd_adapter *adapter);
+static void passive_discovery_started(struct btd_adapter *adapter,
+				      uint8_t status);
+
 static struct discovery_client *discovery_complete(struct btd_adapter *adapter,
 						uint8_t status)
 {
@@ -1898,6 +1936,45 @@ static bool start_discovery_timeout(gpointer user_data)
 	    !!adapter->current_discovery_filter);
 
 	new_type = get_scan_type(adapter);
+
+	if (adapter->discovery_scan_passive && (new_type & SCAN_TYPE_LE)) {
+		if (adapter->passive_scan_session &&
+		    adapter->discovery_enable == 0x01) {
+			if (adapter->discovering)
+				return FALSE;
+
+			adapter->discovering = true;
+			g_dbus_emit_property_changed(dbus_conn, adapter->path,
+						ADAPTER_INTERFACE, "Discovering");
+			return FALSE;
+		}
+
+		if (adapter->discovery_enable == 0x01) {
+			struct mgmt_cp_stop_discovery cp;
+
+			if (adapter->passive_scan_session)
+				stop_passive_le_discovery(adapter);
+			else {
+				cp.type = adapter->discovery_type;
+				mgmt_send(adapter->mgmt, MGMT_OP_STOP_DISCOVERY,
+					  adapter->dev_id, sizeof(cp), &cp,
+					  NULL, NULL, NULL);
+			}
+
+			return FALSE;
+		}
+
+		if (start_passive_le_discovery(adapter) == 0)
+			passive_discovery_started(adapter,
+						MGMT_STATUS_SUCCESS);
+		else
+			passive_discovery_started(adapter, MGMT_STATUS_FAILED);
+
+		return FALSE;
+	}
+
+	if (adapter->passive_scan_session)
+		stop_passive_le_discovery(adapter);
 
 	if (adapter->discovery_enable == 0x01) {
 		struct mgmt_cp_stop_discovery cp;
@@ -2346,6 +2423,163 @@ static bool filters_equal(struct mgmt_cp_start_service_discovery *a,
 	return true;
 }
 
+static void merge_discovery_scan_settings(struct btd_adapter *adapter)
+{
+	GSList *lists[2];
+	size_t i;
+
+	adapter->discovery_scan_passive = false;
+	adapter->discovery_scan_has_timing = false;
+	adapter->discovery_scan_interval = DISCOV_SCAN_INTERVAL_DEFAULT;
+	adapter->discovery_scan_window = DISCOV_SCAN_WINDOW_DEFAULT;
+	adapter->discovery_scan_duplicate = false;
+
+	lists[0] = adapter->discovery_list;
+	lists[1] = adapter->set_filter_list;
+
+	for (i = 0; i < 2; i++) {
+		GSList *l;
+
+		for (l = lists[i]; l != NULL; l = g_slist_next(l)) {
+			struct discovery_client *client = l->data;
+			struct discovery_filter *filter = client->discovery_filter;
+
+			if (!filter)
+				continue;
+
+			if (filter->has_active && !filter->active)
+				adapter->discovery_scan_passive = true;
+
+			if (filter->has_scan_params) {
+				adapter->discovery_scan_has_timing = true;
+				adapter->discovery_scan_interval = filter->interval;
+				adapter->discovery_scan_window = filter->window;
+			}
+
+			adapter->discovery_scan_duplicate = filter->duplicate;
+		}
+	}
+
+	if (adapter->discovery_scan_window == 0 ||
+	    adapter->discovery_scan_window > adapter->discovery_scan_interval)
+		adapter->discovery_scan_window = adapter->discovery_scan_interval;
+}
+
+static void apply_active_discovery_timing(struct btd_adapter *adapter)
+{
+	struct mgmt_tlv_list *list;
+	uint16_t interval = adapter->discovery_scan_interval;
+	uint16_t window = adapter->discovery_scan_window;
+
+	if (!adapter->discovery_scan_has_timing)
+		return;
+
+	if (!btd_has_kernel_features(KERNEL_SET_SYSTEM_CONFIG))
+		return;
+
+	list = mgmt_tlv_list_new();
+	if (!list)
+		return;
+
+	if (!mgmt_tlv_add_fixed(list, 0x0011, &interval) ||
+	    !mgmt_tlv_add_fixed(list, 0x0012, &window)) {
+		mgmt_tlv_list_free(list);
+		return;
+	}
+
+	mgmt_send_tlv(adapter->mgmt, MGMT_OP_SET_DEF_SYSTEM_CONFIG,
+		      adapter->dev_id, list, NULL, NULL, NULL);
+	mgmt_tlv_list_free(list);
+}
+
+static int start_passive_le_discovery(struct btd_adapter *adapter)
+{
+	uint16_t interval = adapter->discovery_scan_interval;
+	uint16_t window = adapter->discovery_scan_window;
+	uint8_t filter_dup;
+	int dd;
+	int err;
+
+	if (!(adapter->current_settings & MGMT_SETTING_LE))
+		return -ENOTSUP;
+
+	dd = hci_open(adapter->dev_id);
+	if (dd < 0)
+		return -errno;
+
+	if (hci_le_set_scan_parameters(dd, LE_SCAN_PASSIVE, interval, window,
+				       0x00, 0x00, 1000) < 0) {
+		err = -errno;
+		hci_close(dd);
+		return err;
+	}
+
+	filter_dup = adapter->discovery_scan_duplicate ?
+			LE_SCAN_FILTER_DUP_DISABLE :
+			LE_SCAN_FILTER_DUP_ENABLE;
+
+	if (hci_le_set_scan_enable(dd, 0x01, filter_dup, 1000) < 0) {
+		err = -errno;
+		hci_close(dd);
+		return err;
+	}
+
+	hci_close(dd);
+	return 0;
+}
+
+static void stop_passive_le_discovery(struct btd_adapter *adapter)
+{
+	int dd;
+
+	if (!adapter->passive_scan_session)
+		return;
+
+	dd = hci_open(adapter->dev_id);
+	if (dd >= 0) {
+		(void)hci_le_set_scan_enable(dd, 0x00, 0x00, 1000);
+		hci_close(dd);
+	}
+
+	adapter->passive_scan_session = false;
+}
+
+static void passive_discovery_started(struct btd_adapter *adapter, uint8_t status)
+{
+	if (status != MGMT_STATUS_SUCCESS) {
+		discovery_complete(adapter, status);
+		return;
+	}
+
+	adapter->passive_scan_session = true;
+	adapter->discovery_type = SCAN_TYPE_LE;
+	adapter->discovery_enable = 0x01;
+
+	if (adapter->current_discovery_filter)
+		adapter->filtered_discovery = true;
+	else
+		adapter->filtered_discovery = false;
+
+	discovery_complete(adapter, MGMT_STATUS_SUCCESS);
+
+	if (adapter->discovering)
+		return;
+
+	adapter->discovering = true;
+	g_dbus_emit_property_changed(dbus_conn, adapter->path,
+				     ADAPTER_INTERFACE, "Discovering");
+}
+
+static void apply_discovery_scan_settings(struct btd_adapter *adapter)
+{
+	merge_discovery_scan_settings(adapter);
+
+	if (adapter->discovery_scan_passive)
+		return;
+
+	apply_active_discovery_timing(adapter);
+}
+
 static int update_discovery_filter(struct btd_adapter *adapter)
 {
 	struct mgmt_cp_start_service_discovery *sd_cp;
@@ -2391,6 +2625,7 @@ static int update_discovery_filter(struct btd_adapter *adapter)
 	g_free(adapter->current_discovery_filter);
 	adapter->current_discovery_filter = sd_cp;
 
+	apply_discovery_scan_settings(adapter);
 	trigger_start_discovery(adapter, 0);
 
 	return -EINPROGRESS;
@@ -2415,6 +2650,19 @@ static int discovery_stop(struct discovery_client *client)
 	 * and so it is enough to send out the signal and just return.
 	 */
 	if (adapter->discovery_enable == 0x00) {
+		discovery_remove(client);
+		adapter->discovering = false;
+		g_dbus_emit_property_changed(dbus_conn, adapter->path,
+					ADAPTER_INTERFACE, "Discovering");
+
+		trigger_passive_scanning(adapter);
+
+		return 0;
+	}
+
+	if (adapter->passive_scan_session) {
+		stop_passive_le_discovery(adapter);
+		adapter->discovery_enable = 0x00;
 		discovery_remove(client);
 		adapter->discovering = false;
 		g_dbus_emit_property_changed(dbus_conn, adapter->path,
@@ -2659,6 +2907,42 @@ static bool parse_pattern(DBusMessageIter *value,
 	return true;
 }
 
+static bool parse_interval(DBusMessageIter *value,
+					struct discovery_filter *filter)
+{
+	if (dbus_message_iter_get_arg_type(value) != DBUS_TYPE_UINT16)
+		return false;
+
+	dbus_message_iter_get_basic(value, &filter->interval);
+	filter->has_scan_params = true;
+
+	return true;
+}
+
+static bool parse_window(DBusMessageIter *value,
+					struct discovery_filter *filter)
+{
+	if (dbus_message_iter_get_arg_type(value) != DBUS_TYPE_UINT16)
+		return false;
+
+	dbus_message_iter_get_basic(value, &filter->window);
+	filter->has_scan_params = true;
+
+	return true;
+}
+
+static bool parse_active(DBusMessageIter *value,
+					struct discovery_filter *filter)
+{
+	if (dbus_message_iter_get_arg_type(value) != DBUS_TYPE_BOOLEAN)
+		return false;
+
+	dbus_message_iter_get_basic(value, &filter->active);
+	filter->has_active = true;
+
+	return true;
+}
+
 struct filter_parser {
 	const char *name;
 	bool (*func)(DBusMessageIter *iter, struct discovery_filter *filter);
@@ -2670,6 +2954,9 @@ struct filter_parser {
 	{ "DuplicateData", parse_duplicate_data },
 	{ "Discoverable", parse_discoverable },
 	{ "Pattern", parse_pattern },
+	{ "Interval", parse_interval },
+	{ "Window", parse_window },
+	{ "Active", parse_active },
 	{ }
 };
 
@@ -2711,6 +2998,11 @@ static bool parse_discovery_filter_dict(struct btd_adapter *adapter,
 	(*filter)->duplicate = false;
 	(*filter)->discoverable = false;
 	(*filter)->pattern = NULL;
+	(*filter)->has_active = false;
+	(*filter)->active = true;
+	(*filter)->has_scan_params = false;
+	(*filter)->interval = 0;
+	(*filter)->window = 0;
 
 	dbus_message_iter_init(msg, &iter);
 	if (dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_ARRAY ||
@@ -7388,6 +7680,8 @@ static void adapter_stop(struct btd_adapter *adapter)
 	reply_pending_requests(adapter);
 
 	cancel_passive_scanning(adapter);
+
+	stop_passive_le_discovery(adapter);
 
 	remove_discovery_list(adapter);
 

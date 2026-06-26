@@ -162,6 +162,13 @@ Properties	string Type
 			provided value must be in range [-127 to +20], where
 			units are in dBm.
 
+		string CentralAddress
+
+			Peer address for directed legacy advertising. When
+			present the advertisement is connectable and
+			non-scannable (ADV_DIRECT_IND). The address must be
+			in the form "AA:BB:CC:DD:EE:FF".
+
 
 LE Advertising Manager hierarchy
 ================================

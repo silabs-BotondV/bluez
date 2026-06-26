@@ -85,6 +85,8 @@ struct btd_adv_client {
 	uint32_t min_interval;
 	uint32_t max_interval;
 	int8_t tx_power;
+	bdaddr_t central_addr;
+	bool has_central_addr;
 	mgmt_request_func_t refresh_done_func;
 };
 
@@ -251,6 +253,30 @@ static bool parse_type(DBusMessageIter *iter, struct btd_adv_client *client)
 	}
 
 	return false;
+}
+
+static bool parse_central_address(DBusMessageIter *iter,
+					struct btd_adv_client *client)
+{
+	const char *address;
+
+	if (!iter)
+		return true;
+
+	if (dbus_message_iter_get_arg_type(iter) != DBUS_TYPE_STRING)
+		return false;
+
+	dbus_message_iter_get_basic(iter, &address);
+
+	if (!address || !strlen(address))
+		return false;
+
+	if (str2ba(address, &client->central_addr) < 0)
+		return false;
+
+	client->has_central_addr = true;
+
+	return true;
 }
 
 static bool parse_service_uuids(DBusMessageIter *iter,
@@ -809,6 +835,9 @@ static uint8_t *generate_scan_rsp(struct btd_adv_client *client,
 static bool adv_client_has_scan_response(struct btd_adv_client *client,
 						uint32_t flags)
 {
+	if (client->has_central_addr)
+		return false;
+
 	/* The local name isn't added into the bt_ad structure until
 	 * generate_scan_rsp is called, so we must check these conditions as
 	 * well.
@@ -1183,6 +1212,7 @@ static struct adv_parser {
 	{ "MinInterval", parse_min_interval },
 	{ "MaxInterval", parse_max_interval },
 	{ "TxPower", parse_tx_power },
+	{ "CentralAddress", parse_central_address },
 	{ },
 };
 
